@@ -99,10 +99,15 @@ tests/test_main.py    Validation, snapshot and HTTP route tests
 
 | Route | Action |
 | --- | --- |
+| `GET /health` | Lightweight readiness check |
 | `GET /api/stats` | Read a JSON snapshot |
 | `GET /events` | Subscribe to SSE snapshots |
 | `POST /api/start` | Start a validated local test |
 | `POST /api/stop` | Request cancellation |
+
+Control endpoints accept same-origin requests only. Responses include browser
+hardening headers, and request bodies are limited to 4 KiB. The server also
+handles `HEAD` requests for static resources and API readiness checks.
 
 Start body example:
 
@@ -112,10 +117,18 @@ Start body example:
 
 ## Verify
 
+The test suite covers URL and parameter validation, route behavior, security
+headers, same-origin controls, SSE delivery, concurrent-run rejection, stop
+handling, and a real local HTTP run.
+
 ```bash
 python3 -m unittest discover -s tests -v
 python3 -m py_compile main.py
+git diff --check
 ```
+
+The repository includes a GitHub Actions workflow that runs the same checks on
+supported Python versions for every push and pull request.
 
 ## Limitations
 

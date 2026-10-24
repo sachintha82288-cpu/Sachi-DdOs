@@ -1,93 +1,94 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SACHI-DDOS // REAL-TIME LOAD CONSOLE</title>
-<link rel="stylesheet" href="/static/style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Bounded loopback HTTP testing console with live telemetry">
+  <title>SACHI-DDOS // REAL-TIME LOAD CONSOLE</title>
+  <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<div class="scanlines"></div>
-<header class="topbar">
-  <div class="brand">
-    <span class="glyph">▸</span> SACHI-DDOS <span class="ver">v1.0</span>
-  </div>
-  <div class="status">
-    <span id="connDot" class="dot"></span>
-    <span id="connText">CONNECTING</span>
-  </div>
-  <div class="warn">FOR TESTING YOUR OWN INFRASTRUCTURE ONLY</div>
-</header>
+  <div class="scanlines" aria-hidden="true"></div>
+  <header class="topbar">
+    <div class="brand">
+      <span class="glyph" aria-hidden="true">▸</span> SACHI-DDOS <span class="ver">v1.1</span>
+    </div>
+    <div class="status" role="status" aria-live="polite">
+      <span id="connDot" class="dot" aria-hidden="true"></span>
+      <span id="connText">CONNECTING</span>
+    </div>
+    <div class="warn">FOR TESTING YOUR OWN INFRASTRUCTURE ONLY</div>
+  </header>
 
-<main class="grid">
-  <!-- INPUT PANEL -->
-  <section class="panel input-panel">
-    <div class="panel-title">▸ INPUT / CONFIG</div>
+  <main class="grid">
+    <section class="panel input-panel" aria-labelledby="input-title">
+      <div class="panel-title" id="input-title">▸ INPUT / CONFIG</div>
 
-    <label for="target">TARGET URL</label>
-    <input id="target" type="text" placeholder="http://127.0.0.1:8081" value="http://127.0.0.1:8081">
+      <label for="target">TARGET URL</label>
+      <input id="target" type="url" inputmode="url" autocomplete="off"
+             placeholder="http://127.0.0.1:8081" value="http://127.0.0.1:8081">
 
-    <label for="method">METHOD</label>
-    <select id="method">
-      <option>GET</option>
-      <option>HEAD</option>
-    </select>
+      <label for="method">METHOD</label>
+      <select id="method">
+        <option value="GET">GET</option>
+        <option value="HEAD">HEAD</option>
+      </select>
 
-    <div class="row">
-      <div class="col">
-        <label for="threads">THREADS</label>
-    <input id="threads" type="number" min="1" max="4" value="2">
+      <div class="row">
+        <div class="col">
+          <label for="threads">THREADS</label>
+          <input id="threads" type="number" min="1" max="4" step="1" value="2">
+        </div>
+        <div class="col">
+          <label for="duration">DURATION (s)</label>
+          <input id="duration" type="number" min="1" max="60" step="1" value="10">
+        </div>
       </div>
-      <div class="col">
-        <label for="duration">DURATION (s)</label>
-    <input id="duration" type="number" min="1" max="60" value="10">
+
+      <label for="rps">REQUESTS / SECOND (1–10)</label>
+      <input id="rps" type="number" min="1" max="10" step="1" value="5">
+
+      <div class="btns">
+        <button id="startBtn" class="btn start" type="button">▸ START</button>
+        <button id="stopBtn" class="btn stop" type="button" disabled>■ STOP</button>
       </div>
-    </div>
 
-    <label for="rps">REQUESTS / SECOND (1–10)</label>
-    <input id="rps" type="number" min="1" max="10" value="5">
+      <div id="msg" class="msg" role="status" aria-live="polite"></div>
 
-    <div class="btns">
-      <button id="startBtn" class="btn start">▸ START</button>
-      <button id="stopBtn" class="btn stop" disabled>■ STOP</button>
-    </div>
+      <p class="note">
+        LOCAL LAB MODE · Loopback targets only. Up to 4 workers, 10 requests/second,
+        and 60 seconds. Response reads capped at 64 KiB.
+      </p>
+    </section>
 
-    <div id="msg" class="msg"></div>
+    <section class="panel monitor-panel" aria-labelledby="monitor-title">
+      <div class="panel-title" id="monitor-title">▸ REAL-TIME MONITOR</div>
 
-    <div class="note">
-      LOCAL LAB MODE · Loopback targets only. Up to 4 workers, 10 requests/second, and 60 seconds. Response reads capped at 64 KiB.
-    </div>
-  </section>
+      <div class="stats" aria-label="Live test statistics">
+        <div class="stat"><div class="k">RPS</div><div class="v" id="sRps">0</div></div>
+        <div class="stat"><div class="k">PEAK</div><div class="v" id="sPeak">0</div></div>
+        <div class="stat"><div class="k">TOTAL</div><div class="v" id="sTotal">0</div></div>
+        <div class="stat"><div class="k">OK</div><div class="v ok" id="sOk">0</div></div>
+        <div class="stat"><div class="k">FAIL</div><div class="v fail" id="sFail">0</div></div>
+        <div class="stat"><div class="k">AVG ms</div><div class="v" id="sLat">0.00</div></div>
+        <div class="stat"><div class="k">BYTES</div><div class="v" id="sBytes">0</div></div>
+        <div class="stat"><div class="k">ELAPSED</div><div class="v" id="sElapsed">0.00</div></div>
+      </div>
 
-  <!-- MONITOR PANEL -->
-  <section class="panel monitor-panel">
-    <div class="panel-title">▸ REAL-TIME MONITOR</div>
+      <div class="chart-wrap">
+        <canvas id="chart" width="900" height="220"
+                aria-label="Rolling requests per second chart" role="img"></canvas>
+      </div>
 
-    <div class="stats">
-      <div class="stat"><div class="k">RPS</div><div class="v" id="sRps">0</div></div>
-      <div class="stat"><div class="k">PEAK</div><div class="v" id="sPeak">0</div></div>
-      <div class="stat"><div class="k">TOTAL</div><div class="v" id="sTotal">0</div></div>
-      <div class="stat"><div class="k">OK</div><div class="v ok" id="sOk">0</div></div>
-      <div class="stat"><div class="k">FAIL</div><div class="v fail" id="sFail">0</div></div>
-      <div class="stat"><div class="k">AVG ms</div><div class="v" id="sLat">0</div></div>
-      <div class="stat"><div class="k">BYTES</div><div class="v" id="sBytes">0</div></div>
-      <div class="stat"><div class="k">ELAPSED</div><div class="v" id="sElapsed">0.00</div></div>
-    </div>
+      <div class="codes" id="codes" aria-label="HTTP status code counts"></div>
+    </section>
 
-    <div class="chart-wrap">
-      <canvas id="chart" width="900" height="220"></canvas>
-    </div>
+    <section class="panel output-panel" aria-labelledby="output-title">
+      <div class="panel-title" id="output-title">▸ OUTPUT / LOG</div>
+      <div class="term" id="term" role="log" aria-live="polite" aria-relevant="additions"></div>
+    </section>
+  </main>
 
-    <div class="codes" id="codes"></div>
-  </section>
-
-  <!-- OUTPUT PANEL -->
-  <section class="panel output-panel">
-    <div class="panel-title">▸ OUTPUT / LOG</div>
-    <div class="term" id="term"></div>
-  </section>
-</main>
-
-<script src="/static/app.js"></script>
+  <script src="/static/app.js"></script>
 </body>
 </html>

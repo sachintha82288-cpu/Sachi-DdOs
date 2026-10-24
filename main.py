@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Dependency-free, bounded loopback HTTP testing console."""
+
+from __future__ import annotations
+
 import argparse
+import copy
 import http.client
 import ipaddress
 import json
@@ -9,62 +13,142 @@ import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from typing import NamedTuple, Optional
+from urllib.parse import SplitResult, urlsplit
 
-STATIC = Path(__file__).resolve().parent / 'static'
+STATIC = Path(__file__).resolve().parent / "static"
+MAX_REQUEST_BODY = 4096
+MAX_TARGET_LENGTH = 2048
+MAX_RESPONSE_BYTES = 64 * 1024
+REQUEST_TIMEOUT_SECONDS = 2
+METRICS_INTERVAL_SECONDS = 0.25
+SSE_INTERVAL_SECONDS = 0.25
+
 LOCK = threading.RLock()
 CONTROL = threading.Lock()
-STATE = dict(running=False, target='', total=0, success=0, failed=0,
-             bytes_rx=0, elapsed=0, remaining=0, rps=0, peak_rps=0,
-             avg_latency_ms=0, status_codes={}, errors=[], rps_history=[])
 STOP = threading.Event()
+STATE = {
+    "running": False,
+    "target": "",
+    "total": 0,
+    "success": 0,
+    "failed": 0,
+    "bytes_rx": 0,
+    "elapsed": 0,
+    "remaining": 0,
+    "rps": 0,
+    "peak_rps": 0,
+    "avg_latency_ms": 0,
+    "status_codes": {},
+    "errors": [],
+    "rps_history": [],
+}
 
 
-def validate(payload):
+class TestConfig(NamedTuple):
+    """Validated settings passed to a test run.
+
+    The tuple shape is kept deliberately small and index-compatible with the
+    original public ``validate`` helper while giving callers named fields.
+    """
+
+    target: str
+    parsed: SplitResult
+    host: str
+    port: int
+    method: str
+    limits: tuple[int, int, int]
+
+
+def validate(payload: object) -> TestConfig:
+    """Validate and normalize a test request.
+
+    Only literal loopback addresses and ``localhost`` are accepted.  Literal
+    address validation avoids DNS rebinding and keeps the console local-only.
+    """
+
     if not isinstance(payload, dict):
-        raise ValueError('Expected a JSON object')
-    target = str(payload.get('target', '')).strip()
-    parsed = urlsplit(target)
-    if parsed.scheme not in ('http', 'https') or not parsed.hostname:
-        raise ValueError('Enter an http:// or https:// loopback URL')
-    if parsed.username or parsed.password or parsed.fragment:
-        raise ValueError('Credentials and fragments are not supported')
-    host = parsed.hostname
-    if host == 'localhost':
-        host = '127.0.0.1'
+        raise ValueError("Expected a JSON object")
+
+    raw_target = payload.get("target", "")
+    if not isinstance(raw_target, str):
+        raise ValueError("Target must be a URL string")
+    target = raw_target.strip()
+    if not target:
+        raise ValueError("Enter an http:// or https:// loopback URL")
+    if len(target) > MAX_TARGET_LENGTH:
+        raise ValueError(f"Target URL must be {MAX_TARGET_LENGTH} characters or fewer")
+
     try:
-        if not ipaddress.ip_address(host).is_loopback:
-            raise ValueError()
-    except ValueError:
-        raise ValueError('Only literal loopback addresses or localhost are allowed')
-    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
-    method = payload.get('method', 'GET')
-    if method not in ('GET', 'HEAD'):
-        raise ValueError('Only GET and HEAD are supported')
-    values = []
-    for key, default, low, high in [('threads', 2, 1, 4), ('duration', 10, 1, 60), ('rps_cap', 5, 1, 10)]:
+        parsed = urlsplit(target)
+        hostname = parsed.hostname
+        explicit_port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Enter a valid loopback URL") from exc
+
+    if parsed.scheme not in ("http", "https") or not hostname:
+        raise ValueError("Enter an http:// or https:// loopback URL")
+    if parsed.username or parsed.password or parsed.fragment:
+        raise ValueError("Credentials and fragments are not supported")
+
+    host = hostname.lower()
+    if host == "localhost":
+        connect_host = "127.0.0.1"
+    else:
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise ValueError("Only literal loopback addresses or localhost are allowed") from exc
+        if not address.is_loopback:
+            raise ValueError("Only literal loopback addresses or localhost are allowed")
+        connect_host = host
+
+    port = explicit_port if explicit_port is not None else (443 if parsed.scheme == "https" else 80)
+    if not 1 <= port <= 65535:
+        raise ValueError("Port must be between 1 and 65535")
+
+    method = payload.get("method", "GET")
+    if method not in ("GET", "HEAD"):
+        raise ValueError("Only GET and HEAD are supported")
+
+    limits: list[int] = []
+    for key, default, low, high in (
+        ("threads", 2, 1, 4),
+        ("duration", 10, 1, 60),
+        ("rps_cap", 5, 1, 10),
+    ):
         value = payload.get(key, default)
         if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
-            raise ValueError(f'{key} must be an integer between {low} and {high}')
-        values.append(value)
-    return target, parsed, host, port, method, values
+            raise ValueError(f"{key} must be an integer between {low} and {high}")
+        limits.append(value)
+
+    return TestConfig(target, parsed, connect_host, port, method, tuple(limits))
 
 
-def snapshot():
+def snapshot() -> dict:
+    """Return an isolated copy of the current metrics."""
+
     with LOCK:
-        return json.loads(json.dumps(STATE))
+        return copy.deepcopy(STATE)
 
 
-def run(config):
-    target, parsed, host, port, method, (workers, duration, rate) = config
+def _record_error(message: str) -> None:
+    with LOCK:
+        STATE["errors"] = (STATE["errors"] + [message[:200]])[-20:]
+
+
+def run(config: TestConfig) -> None:
+    """Run one bounded test and publish metrics until every worker exits."""
+
+    _target, parsed, host, port, method, (workers, duration, rate) = config
     started = time.monotonic()
     deadline = started + duration
-    samples = deque(maxlen=1000)
-    latencies = deque(maxlen=1000)
+    samples: deque[float] = deque(maxlen=1000)
+    latencies: deque[float] = deque(maxlen=1000)
     next_slot = started
     slots_lock = threading.Lock()
 
-    def worker():
+    def worker() -> None:
         nonlocal next_slot
         while not STOP.is_set():
             with slots_lock:
@@ -72,138 +156,310 @@ def run(config):
                 next_slot = slot + 1 / rate
             if slot >= deadline or STOP.wait(max(0, slot - time.monotonic())):
                 break
-            conn = None
-            t0 = time.monotonic()
-            status, size, error = None, 0, None
+
+            connection = None
+            started_request = time.monotonic()
+            status = None
+            response_size = 0
+            error = None
             try:
-                cls = http.client.HTTPSConnection if parsed.scheme == 'https' else http.client.HTTPConnection
-                conn = cls(host, port, timeout=2)
-                path = (parsed.path or '/') + ('?' + parsed.query if parsed.query else '')
-                conn.request(method, path, headers={'User-Agent': 'Sachi-Local-Console/1.0', 'Connection': 'close'})
-                response = conn.getresponse()
+                connection_type = (
+                    http.client.HTTPSConnection
+                    if parsed.scheme == "https"
+                    else http.client.HTTPConnection
+                )
+                connection = connection_type(host, port, timeout=REQUEST_TIMEOUT_SECONDS)
+                path = parsed.path or "/"
+                if parsed.query:
+                    path += "?" + parsed.query
+                connection.request(
+                    method,
+                    path,
+                    headers={
+                        "User-Agent": "Sachi-Local-Console/1.0",
+                        "Connection": "close",
+                    },
+                )
+                response = connection.getresponse()
                 status = response.status
-                size = len(response.read(65536))
+                response_size = len(response.read(MAX_RESPONSE_BYTES))
                 if not 200 <= status < 400:
-                    error = f'HTTP {status}'
+                    error = f"HTTP {status}"
             except (OSError, http.client.HTTPException) as exc:
-                error = f'{type(exc).__name__}: {exc}'
+                detail = str(exc).strip() or "request failed"
+                error = f"{type(exc).__name__}: {detail}"
+            except Exception as exc:  # Keep one malformed response from orphaning a run.
+                error = f"{type(exc).__name__}: request failed"
             finally:
-                if conn:
-                    conn.close()
-            now = time.monotonic()
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except OSError:
+                        pass
+
+            completed = time.monotonic()
             with LOCK:
-                samples.append(now)
-                latencies.append((now - t0) * 1000)
-                STATE['total'] += 1
-                STATE['failed' if error else 'success'] += 1
-                STATE['bytes_rx'] += size
-                STATE['avg_latency_ms'] = round(sum(latencies) / len(latencies), 2)
+                samples.append(completed)
+                latencies.append((completed - started_request) * 1000)
+                STATE["total"] += 1
+                STATE["failed" if error else "success"] += 1
+                STATE["bytes_rx"] += response_size
+                STATE["avg_latency_ms"] = round(sum(latencies) / len(latencies), 2)
                 if status is not None:
-                    key = str(status)
-                    STATE['status_codes'][key] = STATE['status_codes'].get(key, 0) + 1
+                    code = str(status)
+                    STATE["status_codes"][code] = STATE["status_codes"].get(code, 0) + 1
                 if error:
-                    STATE['errors'] = (STATE['errors'] + [error])[-20:]
+                    STATE["errors"] = (STATE["errors"] + [error])[-20:]
 
-    threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
-    for thread in threads:
-        thread.start()
-    while any(thread.is_alive() for thread in threads):
-        now = time.monotonic()
-        if now >= deadline:
-            STOP.set()
+    threads = [
+        threading.Thread(target=worker, name=f"sachi-worker-{index + 1}", daemon=True)
+        for index in range(workers)
+    ]
+
+    started_threads: list[threading.Thread] = []
+    try:
+        for thread in threads:
+            thread.start()
+            started_threads.append(thread)
+
+        while any(thread.is_alive() for thread in started_threads):
+            now = time.monotonic()
+            if now >= deadline:
+                STOP.set()
+            with LOCK:
+                current_rps = sum(timestamp > now - 1 for timestamp in samples)
+                STATE.update(
+                    rps=current_rps,
+                    peak_rps=max(STATE["peak_rps"], current_rps),
+                    elapsed=round(now - started, 2),
+                    remaining=round(max(0, deadline - now), 2),
+                )
+                STATE["rps_history"] = (STATE["rps_history"] + [current_rps])[-300:]
+            time.sleep(METRICS_INTERVAL_SECONDS)
+    except Exception as exc:
+        _record_error(f"{type(exc).__name__}: test runner failed")
+        STOP.set()
+    finally:
+        for thread in started_threads:
+            thread.join(timeout=REQUEST_TIMEOUT_SECONDS + 1)
         with LOCK:
-            rps = sum(t > now - 1 for t in samples)
-            STATE.update(rps=rps, peak_rps=max(STATE['peak_rps'], rps),
-                         elapsed=round(now - started, 2), remaining=round(max(0, deadline - now), 2))
-            STATE['rps_history'] = (STATE['rps_history'] + [rps])[-300:]
-        time.sleep(.25)
-    with LOCK:
-        STATE.update(running=False, rps=0, remaining=0, elapsed=round(time.monotonic() - started, 2))
+            STATE.update(
+                running=False,
+                rps=0,
+                remaining=0,
+                elapsed=round(time.monotonic() - started, 2),
+            )
 
 
-def start_test(payload):
+def start_test(payload: object) -> tuple[bool, str]:
+    """Validate and start a test unless another run is active."""
+
     config = validate(payload)
     with CONTROL, LOCK:
-        if STATE['running']:
-            return False, 'A test is already running; stop it and wait for completion'
+        if STATE["running"]:
+            return False, "A test is already running; stop it and wait for completion"
         STOP.clear()
-        STATE.update(running=True, target=config[0], total=0, success=0, failed=0,
-                     bytes_rx=0, elapsed=0, remaining=config[5][1], rps=0, peak_rps=0,
-                     avg_latency_ms=0, status_codes={}, errors=[], rps_history=[])
-        threading.Thread(target=run, args=(config,), daemon=True).start()
-    return True, 'Local test started'
+        STATE.update(
+            running=True,
+            target=config.target,
+            total=0,
+            success=0,
+            failed=0,
+            bytes_rx=0,
+            elapsed=0,
+            remaining=config.limits[1],
+            rps=0,
+            peak_rps=0,
+            avg_latency_ms=0,
+            status_codes={},
+            errors=[],
+            rps_history=[],
+        )
+        threading.Thread(target=run, args=(config,), name="sachi-test-run", daemon=True).start()
+    return True, "Local test started"
+
+
+def stop_test() -> tuple[bool, str]:
+    """Request cancellation and report whether a run was active."""
+
+    with LOCK:
+        if not STATE["running"]:
+            return False, "No test is running"
+        STOP.set()
+    return True, "Stopping; waiting for in-flight requests"
+
+
+class ConsoleServer(ThreadingHTTPServer):
+    """HTTP server configured to let disconnected clients cleanly exit."""
+
+    allow_reuse_address = True
+    daemon_threads = True
 
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *args):
+    """Small same-origin API and static-file handler."""
+
+    server_version = "SachiConsole/1.1"
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+
+    ASSETS = {
+        "/": ("index.html", "text/html; charset=utf-8"),
+        "/index.html": ("index.html", "text/html; charset=utf-8"),
+        "/static/style.css": ("style.css", "text/css; charset=utf-8"),
+        "/static/app.js": ("app.js", "application/javascript; charset=utf-8"),
+    }
+
+    def log_message(self, *_args: object) -> None:
         pass
 
-    def send_body(self, code, body, content_type='application/json'):
-        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+    def _send_headers(self, code: int, content_type: str, length: Optional[int] = None) -> None:
         self.send_response(code)
-        self.send_header('Content-Type', content_type)
-        self.send_header('Content-Length', str(len(data)))
-        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header("Content-Type", content_type)
+        if length is not None:
+            self.send_header("Content-Length", str(length))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self'; "
+            "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        )
         self.end_headers()
-        self.wfile.write(data)
 
-    def do_GET(self):
-        path = urlsplit(self.path).path
-        assets = {'/': ('index.html', 'text/html; charset=utf-8'),
-                  '/index.html': ('index.html', 'text/html; charset=utf-8'),
-                  '/static/style.css': ('style.css', 'text/css'),
-                  '/static/app.js': ('app.js', 'application/javascript')}
-        if path in assets:
-            name, mime = assets[path]
-            self.send_body(200, (STATIC / name).read_bytes(), mime)
-        elif path == '/api/stats':
-            self.send_body(200, snapshot())
-        elif path == '/events':
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/event-stream')
-            self.send_header('Cache-Control', 'no-cache')
-            self.send_header('X-Accel-Buffering', 'no')
-            self.end_headers()
-            try:
-                while True:
-                    self.wfile.write(('data: ' + json.dumps(snapshot()) + '\n\n').encode())
-                    self.wfile.flush()
-                    time.sleep(.25)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-        else:
-            self.send_body(404, {'ok': False, 'msg': 'Not found'})
+    def send_body(
+        self,
+        code: int,
+        body: object,
+        content_type: str = "application/json; charset=utf-8",
+        *,
+        write: bool = True,
+    ) -> None:
+        data = body if isinstance(body, bytes) else json.dumps(body).encode("utf-8")
+        self._send_headers(code, content_type, len(data))
+        if write:
+            self.wfile.write(data)
 
-    def do_POST(self):
-        # Browser cross-origin control requests are not accepted.
-        origin = self.headers.get('Origin')
-        if origin and urlsplit(origin).netloc != self.headers.get('Host'):
-            self.send_body(403, {'ok': False, 'msg': 'Cross-origin control is disabled'})
+    def _path(self) -> str:
+        return urlsplit(self.path).path
+
+    def _serve_asset(self, path: str, *, head_only: bool = False) -> None:
+        asset = self.ASSETS.get(path)
+        if asset is None:
+            self.send_body(404, {"ok": False, "msg": "Not found"}, write=not head_only)
             return
+        name, content_type = asset
         try:
-            length = int(self.headers.get('Content-Length', '0'))
-            if not 0 <= length <= 4096:
-                raise ValueError('Request body exceeds limit')
-            payload = json.loads(self.rfile.read(length) or b'{}')
-            if self.path == '/api/start':
-                ok, msg = start_test(payload)
-                self.send_body(200 if ok else 409, {'ok': ok, 'msg': msg})
-            elif self.path == '/api/stop':
-                STOP.set()
-                self.send_body(200, {'ok': True, 'msg': 'Stopping; waiting for in-flight requests'})
+            data = (STATIC / name).read_bytes()
+        except OSError:
+            self.send_body(500, {"ok": False, "msg": "Static asset unavailable"}, write=not head_only)
+            return
+        self.send_body(200, data, content_type, write=not head_only)
+
+    def _send_events_headers(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+        self.end_headers()
+
+    def _serve_events(self) -> None:
+        self._send_events_headers()
+        try:
+            while True:
+                payload = json.dumps(snapshot(), separators=(",", ":"))
+                self.wfile.write(("data: " + payload + "\n\n").encode("utf-8"))
+                self.wfile.flush()
+                time.sleep(SSE_INTERVAL_SECONDS)
+        except OSError:
+            pass
+
+    def _serve_get(self, *, head_only: bool = False) -> None:
+        path = self._path()
+        if path in self.ASSETS:
+            self._serve_asset(path, head_only=head_only)
+        elif path == "/api/stats":
+            self.send_body(200, snapshot(), write=not head_only)
+        elif path == "/health":
+            self.send_body(200, {"ok": True, "service": "sachi-console"}, write=not head_only)
+        elif path == "/events":
+            if not head_only:
+                self._serve_events()
             else:
-                self.send_body(404, {'ok': False, 'msg': 'Not found'})
-        except (ValueError, TypeError) as exc:
-            self.send_body(400, {'ok': False, 'msg': str(exc)})
+                self._send_events_headers()
+        else:
+            self.send_body(404, {"ok": False, "msg": "Not found"}, write=not head_only)
+
+    def do_GET(self) -> None:
+        self._serve_get()
+
+    def do_HEAD(self) -> None:
+        self._serve_get(head_only=True)
+
+    def _same_origin(self) -> bool:
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        try:
+            origin_parts = urlsplit(origin)
+        except ValueError:
+            return False
+        host = self.headers.get("Host", "")
+        return bool(origin_parts.scheme and origin_parts.hostname and origin_parts.netloc) and (
+            origin_parts.netloc.lower() == host.lower()
+        )
+
+    def do_POST(self) -> None:
+        if not self._same_origin():
+            self.send_body(403, {"ok": False, "msg": "Cross-origin control is disabled"})
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 <= length <= MAX_REQUEST_BODY:
+                self.close_connection = True
+                raise ValueError("Request body exceeds limit")
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            path = self._path()
+            if path == "/api/start":
+                ok, message = start_test(payload)
+                self.send_body(200 if ok else 409, {"ok": ok, "msg": message})
+            elif path == "/api/stop":
+                ok, message = stop_test()
+                self.send_body(200 if ok else 409, {"ok": ok, "msg": message})
+            else:
+                self.send_body(404, {"ok": False, "msg": "Not found"})
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            self.send_body(400, {"ok": False, "msg": str(exc)})
 
 
-def main():
+def valid_port(value: str) -> int:
+    """Argparse type for a TCP port."""
+
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("port must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--host', default='127.0.0.1')
-    parser.add_argument('--port', type=int, default=8080)
+    parser.add_argument("--host", default="127.0.0.1", help="console bind address")
+    parser.add_argument("--port", type=valid_port, default=8080, help="console listen port")
     args = parser.parse_args()
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f'Sachi console on {args.host}:{args.port}', flush=True)
+
+    server = ConsoleServer((args.host, args.port), Handler)
+    print(f"Sachi console on {args.host}:{args.port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -212,5 +468,5 @@ def main():
         server.server_close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

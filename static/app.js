@@ -6,150 +6,234 @@ const ctx = chart.getContext("2d");
 
 let running = false;
 let rpsHist = [];
+let eventSource = null;
+let reconnectTimer = null;
+let requestInFlight = false;
 
-function log(msg, cls = "") {
-  const div = document.createElement("div");
-  div.className = "line " + cls;
-  const ts = new Date().toLocaleTimeString();
-  div.textContent = `[${ts}] ${msg}`;
-  term.appendChild(div);
+function log(message, cls = "") {
+  const line = document.createElement("div");
+  line.className = `line ${cls}`.trim();
+  const timestamp = new Date().toLocaleTimeString();
+  line.textContent = `[${timestamp}] ${String(message)}`;
+  term.appendChild(line);
   term.scrollTop = term.scrollHeight;
-  // cap
   while (term.childElementCount > 500) term.removeChild(term.firstChild);
 }
 
-function fmt(n) {
-  if (n >= 1e6) return (n/1e6).toFixed(2) + "M";
-  if (n >= 1e3) return (n/1e3).toFixed(1) + "k";
-  return String(n);
+function finiteNumber(value, fallback = 0) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : fallback;
 }
 
-function updateStats(s) {
-  if (running && !s.running) log("Test complete: " + s.total + " requests, " + s.failed + " failed", "info");
-  running = s.running;
-  $("sRps").textContent = s.rps;
-  $("sPeak").textContent = s.peak_rps;
-  $("sTotal").textContent = fmt(s.total);
-  $("sOk").textContent = fmt(s.success);
-  $("sFail").textContent = fmt(s.failed);
-  $("sLat").textContent = s.avg_latency_ms;
-  $("sBytes").textContent = fmt(s.bytes_rx);
-  $("sElapsed").textContent = s.elapsed.toFixed(2);
+function fmt(value) {
+  const number = finiteNumber(value);
+  if (number >= 1e6) return `${(number / 1e6).toFixed(2)}M`;
+  if (number >= 1e3) return `${(number / 1e3).toFixed(1)}k`;
+  return String(Math.round(number));
+}
 
-  // status codes
-  codes.innerHTML = "";
-  for (const [code, count] of Object.entries(s.status_codes)) {
-    const pill = document.createElement("span");
-    pill.className = "code-pill";
-    pill.textContent = `${code}: ${count}`;
-    codes.appendChild(pill);
+function setConnectionState(state) {
+  const dot = $("connDot");
+  const text = $("connText");
+  dot.className = "dot";
+  if (state === "connected") {
+    dot.classList.add(running ? "run" : "on");
+    text.textContent = running ? "RUNNING" : "IDLE";
+  } else if (state === "connecting") {
+    text.textContent = "CONNECTING";
+  } else {
+    text.textContent = "RECONNECTING";
+  }
+}
+
+function updateStats(stats) {
+  if (!stats || typeof stats !== "object") return;
+
+  const wasRunning = running;
+  running = Boolean(stats.running);
+  if (wasRunning && !running) {
+    log(
+      `Test complete: ${fmt(stats.total)} requests, ${fmt(stats.failed)} failed`,
+      "info",
+    );
   }
 
-  // chart
-  rpsHist = s.rps_history || [];
+  $("sRps").textContent = fmt(stats.rps);
+  $("sPeak").textContent = fmt(stats.peak_rps);
+  $("sTotal").textContent = fmt(stats.total);
+  $("sOk").textContent = fmt(stats.success);
+  $("sFail").textContent = fmt(stats.failed);
+  $("sLat").textContent = finiteNumber(stats.avg_latency_ms).toFixed(2);
+  $("sBytes").textContent = fmt(stats.bytes_rx);
+  $("sElapsed").textContent = finiteNumber(stats.elapsed).toFixed(2);
+
+  codes.replaceChildren();
+  const statusCodes = stats.status_codes && typeof stats.status_codes === "object"
+    ? stats.status_codes
+    : {};
+  Object.entries(statusCodes)
+    .sort(([a], [b]) => Number(a) - Number(b))
+    .forEach(([code, count]) => {
+      const pill = document.createElement("span");
+      pill.className = "code-pill";
+      pill.textContent = `${code}: ${fmt(count)}`;
+      codes.appendChild(pill);
+    });
+
+  rpsHist = Array.isArray(stats.rps_history)
+    ? stats.rps_history.map((value) => Math.max(0, finiteNumber(value)))
+    : [];
   drawChart();
 
-  // buttons
-  $("startBtn").disabled = s.running;
-  $("stopBtn").disabled = !s.running;
-
-  // conn dot
-  const dot = $("connDot");
-  const txt = $("connText");
-  dot.className = "dot on";
-  txt.textContent = s.running ? "RUNNING" : "IDLE";
-  if (s.running) dot.classList.add("run");
+  $("startBtn").disabled = running || requestInFlight;
+  $("stopBtn").disabled = !running || requestInFlight;
+  if (eventSource) setConnectionState("connected");
 }
 
 function drawChart() {
-  const w = chart.clientWidth || 900;
-  const h = chart.clientHeight || 220;
-  if (chart.width !== w) chart.width = w;
-  if (chart.height !== h) chart.height = h;
-  const W = chart.width, H = chart.height;
+  const width = chart.clientWidth || 900;
+  const height = chart.clientHeight || 220;
+  if (chart.width !== width) chart.width = width;
+  if (chart.height !== height) chart.height = height;
+
+  const W = chart.width;
+  const H = chart.height;
   ctx.clearRect(0, 0, W, H);
 
-  // grid
   ctx.strokeStyle = "#00ff4115";
   ctx.lineWidth = 1;
-  for (let i = 0; i <= 5; i++) {
-    const y = (H / 5) * i;
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+  for (let row = 0; row <= 5; row += 1) {
+    const y = (H / 5) * row;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(W, y);
+    ctx.stroke();
   }
-  for (let i = 0; i <= 10; i++) {
-    const x = (W / 10) * i;
-    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+  for (let column = 0; column <= 10; column += 1) {
+    const x = (W / 10) * column;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, H);
+    ctx.stroke();
   }
 
   if (rpsHist.length < 2) return;
-  const maxv = Math.max(10, ...rpsHist);
+  const maxValue = Math.max(10, ...rpsHist);
   ctx.strokeStyle = "#00ff41";
   ctx.lineWidth = 2;
   ctx.shadowColor = "#00ff41";
   ctx.shadowBlur = 6;
   ctx.beginPath();
-  rpsHist.forEach((v, i) => {
-    const x = (i / (rpsHist.length - 1)) * W;
-    const y = H - (v / maxv) * (H - 10) - 5;
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  rpsHist.forEach((value, index) => {
+    const x = (index / (rpsHist.length - 1)) * W;
+    const y = H - (value / maxValue) * (H - 10) - 5;
+    if (index === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
   });
   ctx.stroke();
   ctx.shadowBlur = 0;
 
-  // label
   ctx.fillStyle = "#00ff41";
   ctx.font = "11px Consolas, monospace";
-  ctx.fillText("max " + maxv + " rps", 8, 14);
+  ctx.fillText(`max ${maxValue} rps`, 8, 14);
 }
 
-// SSE
-let es = null;
-function connect() {
-  es = new EventSource("/events");
-  es.onmessage = (e) => {
-    try { updateStats(JSON.parse(e.data)); } catch (err) {}
+function scheduleReconnect() {
+  if (reconnectTimer !== null) return;
+  reconnectTimer = window.setTimeout(() => {
+    reconnectTimer = null;
+    connectEvents();
+  }, 1500);
+}
+
+function connectEvents() {
+  if (eventSource) eventSource.close();
+  setConnectionState("connecting");
+
+  const source = new EventSource("/events");
+  eventSource = source;
+  source.onopen = () => setConnectionState("connected");
+  source.onmessage = (event) => {
+    try {
+      updateStats(JSON.parse(event.data));
+    } catch (error) {
+      log(`telemetry parse error: ${error.message}`, "err");
+    }
   };
-  es.onerror = () => {
-    $("connDot").className = "dot";
-    $("connText").textContent = "RECONNECTING";
-    setTimeout(connect, 1000);
-    try { es.close(); } catch (e) {}
+  source.onerror = () => {
+    if (eventSource !== source) return;
+    source.close();
+    eventSource = null;
+    setConnectionState("reconnecting");
+    scheduleReconnect();
   };
 }
-connect();
 
-// buttons
+async function postJson(path, payload = {}) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  let data;
+  try {
+    data = await response.json();
+  } catch (_error) {
+    throw new Error(`server returned HTTP ${response.status}`);
+  }
+  if (!response.ok) throw new Error(data.msg || `server returned HTTP ${response.status}`);
+  return data;
+}
+
 $("startBtn").addEventListener("click", async () => {
+  if (requestInFlight || running) return;
   const payload = {
     target: $("target").value.trim(),
     method: $("method").value,
-    threads: parseInt($("threads").value, 10),
-    duration: parseInt($("duration").value, 10),
-    rps_cap: parseInt($("rps").value, 10),
+    threads: Number.parseInt($("threads").value, 10),
+    duration: Number.parseInt($("duration").value, 10),
+    rps_cap: Number.parseInt($("rps").value, 10),
   };
+
+  requestInFlight = true;
+  $("startBtn").disabled = true;
   $("msg").textContent = "";
-  log("starting test -> " + payload.target, "info");
+  log(`starting test -> ${payload.target}`, "info");
   try {
-    const res = await fetch("/api/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-    const data = await res.json();
+    const data = await postJson("/api/start", payload);
     $("msg").textContent = data.msg;
-    if (data.ok) log("started: " + JSON.stringify(payload), "ok");
-    else log("start failed: " + data.msg, "err");
-  } catch (e) {
-    log("request error: " + e, "err");
+    log(`started: ${JSON.stringify(payload)}`, "ok");
+  } catch (error) {
+    $("msg").textContent = error.message;
+    log(`start failed: ${error.message}`, "err");
+  } finally {
+    requestInFlight = false;
+    $("startBtn").disabled = running;
+    $("stopBtn").disabled = !running;
   }
 });
 
 $("stopBtn").addEventListener("click", async () => {
+  if (requestInFlight || !running) return;
+  requestInFlight = true;
+  $("stopBtn").disabled = true;
   try {
-    const res = await fetch("/api/stop", { method: "POST" });
-    const data = await res.json();
+    const data = await postJson("/api/stop");
     $("msg").textContent = data.msg;
-    log("stopped by user", "dim");
-  } catch (e) {
-    log("stop error: " + e, "err");
+    log(data.msg, "dim");
+  } catch (error) {
+    $("msg").textContent = error.message;
+    log(`stop failed: ${error.message}`, "err");
+  } finally {
+    requestInFlight = false;
+    $("stopBtn").disabled = !running;
   }
 });
 
 window.addEventListener("resize", drawChart);
+window.addEventListener("beforeunload", () => {
+  if (eventSource) eventSource.close();
+});
+
 log("SACHI-DDOS console ready. localhost targets allowed by default.", "dim");
+connectEvents();

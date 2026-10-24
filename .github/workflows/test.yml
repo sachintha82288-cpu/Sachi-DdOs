@@ -10,7 +10,8 @@ permissions:
 jobs:
   python:
     name: Python ${{ matrix.python-version }}
-    runs-on: ubuntu-latest
+    # Ubuntu 22.04 retains the Python 3.9 toolchain while newer runners migrate.
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
